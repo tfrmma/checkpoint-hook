@@ -31,22 +31,23 @@ contract CheckpointHookTestBase is Test, Deployers {
     address internal attacker = makeAddr("attacker");
 
     uint48 internal constant BLOCK_OFFSET = 5;
+    uint24 internal constant MIN_TICK_SPACING = 10;
 
     function setUp() public virtual {
         deployFreshManagerAndRouters();
         deployMintAndApprove2Currencies();
 
         uint160 flags = uint160(
-            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
-                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
                 | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
         );
 
-        bytes memory constructorArgs = abi.encode(manager, BLOCK_OFFSET, governance, treasury);
+        bytes memory constructorArgs = abi.encode(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
         (address hookAddress, bytes32 salt) =
             HookMiner.find(address(this), flags, type(CheckpointHook).creationCode, constructorArgs);
 
-        hook = new CheckpointHook{salt: salt}(manager, BLOCK_OFFSET, governance, treasury);
+        hook = new CheckpointHook{salt: salt}(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
         require(address(hook) == hookAddress, "hook address mismatch");
 
         (poolKey, poolId) = initPool(currency0, currency1, IHooks(address(hook)), 3000, 60, SQRT_PRICE_1_1);
