@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install dependencies
+        run: |
+          forge install foundry-rs/forge-std@v1.11.0
+          forge install OpenZeppelin/uniswap-hooks@v1.2.1
+
+      - name: Build
+        run: forge build
+
+      - name: Test
+        run: forge test -vvv
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install dependencies
+        run: |
+          forge install foundry-rs/forge-std@v1.11.0
+          forge install OpenZeppelin/uniswap-hooks@v1.2.1
+
+      - name: Build
+        run: forge build
+
+      - name: Slither
+        uses: crytic/slither-action@v0.4.2
+        with:
+          target: "src/"
+          fail-on: none
+
+      - name: Aderyn
+        uses: Cyfrin/aderyn-ci@v0
+        with:
+          warn-on: any
