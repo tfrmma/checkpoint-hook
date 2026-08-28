@@ -152,6 +152,81 @@ contract CheckpointHookTest is CheckpointHookTestBase {
         assertEq(attackerCurrency1After, 0, "attacker should have fully closed the currency1 leg");
     }
 
+    function testFuzz_sandwichAttack_neverProfitable(uint256 liquidityDelta, uint256 frontrunAmount, uint256 victimAmount)
+        public
+    {
+        liquidityDelta = bound(liquidityDelta, 1e17, 1e26);
+        frontrunAmount = bound(frontrunAmount, 1e10, 3e18);
+        victimAmount = bound(victimAmount, 1e10, 3e18);
+
+        deployFreshManagerAndRouters();
+        deployMintAndApprove2Currencies();
+
+        uint160 flags = uint160(
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory constructorArgs = abi.encode(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
+        (address hookAddress, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(CheckpointHook).creationCode, constructorArgs);
+        CheckpointHook fuzzHook = new CheckpointHook{salt: salt}(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
+        require(address(fuzzHook) == hookAddress);
+
+        (PoolKey memory fuzzKey,) = initPool(currency0, currency1, IHooks(address(fuzzHook)), 3000, 60, SQRT_PRICE_1_1);
+        modifyLiquidityRouter.modifyLiquidity(
+            fuzzKey,
+            ModifyLiquidityParams({
+                tickLower: TickMath.minUsableTick(60),
+                tickUpper: TickMath.maxUsableTick(60),
+                liquidityDelta: int256(liquidityDelta),
+                salt: 0
+            }),
+            ""
+        );
+
+        _fundAndApprove(attacker, 10_000 ether, 0);
+        _fundAndApprove(alice, 10_000 ether, 10_000 ether);
+
+        PoolSwapTest.TestSettings memory settings = PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+        uint256 before0 = currency0.balanceOf(attacker);
+
+        vm.prank(attacker);
+        try swapRouter.swap(
+            fuzzKey,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(frontrunAmount), sqrtPriceLimitX96: MIN_PRICE_LIMIT}),
+            settings,
+            ""
+        ) {} catch {
+            return; // combo pushed price straight to the limit, nothing to sandwich here
+        }
+
+        vm.prank(alice);
+        try swapRouter.swap(
+            fuzzKey,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(victimAmount), sqrtPriceLimitX96: MIN_PRICE_LIMIT}),
+            settings,
+            ""
+        ) {} catch {
+            return;
+        }
+
+        uint256 held1 = currency1.balanceOf(attacker);
+        if (held1 == 0) return; // frontrun rounded to dust, nothing to backrun
+
+        vm.prank(attacker);
+        try swapRouter.swap(
+            fuzzKey,
+            SwapParams({zeroForOne: false, amountSpecified: -int256(held1), sqrtPriceLimitX96: MAX_PRICE_LIMIT}),
+            settings,
+            ""
+        ) {} catch {
+            return;
+        }
+
+        assertLe(currency0.balanceOf(attacker), before0, "attacker must not extract currency0 profit");
+    }
+
     // Same exact bundle, no hook this time. This is the baseline, confirms the pool is actually
     // sandwichable without protection so the test above means something and isn't just passing
     // because the trade sizes happen to be too small to matter.
