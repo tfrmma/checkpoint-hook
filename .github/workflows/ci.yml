@@ -47,11 +47,11 @@ jobs:
       - name: Build
         run: forge build
 
+      - name: Install Slither
+        run: pip3 install slither-analyzer
+
       - name: Slither
-        uses: crytic/slither-action@v0.4.2
-        with:
-          target: "src/"
-          fail-on: none
+        run: slither . --filter-paths "lib/" --fail-none
 
       - name: Aderyn
         uses: Cyfrin/aderyn-ci@v0
