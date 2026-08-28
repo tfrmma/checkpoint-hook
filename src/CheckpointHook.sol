@@ -43,8 +43,10 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 /// - block-boundary sandwiching still works if one builder controls two consecutive blocks
 /// - AntiSandwichHook only protects the !zeroForOne direction upstream, that's a known limitation
 ///   of the library, not something we patched here
-/// - beforeSwap walks every initialized tick crossed since last checkpoint, don't put this on a
-///   pool with tiny tickSpacing and expect it to survive a violent move
+/// - beforeSwap walks every initialized tick crossed since last checkpoint, once per block. We
+///   bound the worst case by refusing to attach to pools below minTickSpacing (enforced at
+///   initialization), but a large enough price move can still make that loop expensive even at a
+///   sane spacing, this reduces the risk, it doesn't eliminate it
 /// - this has NOT been audited independently. AntiSandwichHook/LiquidityPenaltyHook went through a
 ///   scoped OZ audit round upstream, this composition on top of them has not.
 contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step, ReentrancyGuard, IUnlockCallback {
@@ -65,9 +67,11 @@ contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step,
     error ZeroAddress();
     error ZeroAmount();
     error UnauthorizedCallback();
+    error TickSpacingTooSmall(int24 tickSpacing, uint24 minTickSpacing);
 
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
     event FeeDestinationUpdated(FeeDestination oldDestination, FeeDestination newDestination);
+    event MinTickSpacingUpdated(uint24 oldMinTickSpacing, uint24 newMinTickSpacing);
     event CapturedFeeDonated(PoolId indexed poolId, Currency indexed currency, uint256 amount);
     event CapturedFeeSentToTreasury(PoolId indexed poolId, Currency indexed currency, uint256 amount);
     event TreasuryClaimsRedeemed(Currency indexed currency, uint256 amount, address indexed to);
@@ -75,18 +79,22 @@ contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step,
     address public treasury;
     FeeDestination public feeDestination;
 
-    // _blockNumberOffset: JIT window in blocks. 1-3 is a reasonable start on L1, tune per chain
-    // block time. _initialOwner should be a timelocked multisig, not an EOA, this contract can
-    // move where captured MEV goes.
-    constructor(IPoolManager _poolManager, uint48 _blockNumberOffset, address _initialOwner, address _treasury)
-        BaseHook(_poolManager)
-        LiquidityPenaltyHook(_blockNumberOffset)
-        Ownable(_initialOwner)
-    {
+    // floor on key.tickSpacing, enforced at pool init, bounds the tick-crossing loop's worst case
+    uint24 public minTickSpacing;
+
+    constructor(
+        IPoolManager _poolManager,
+        uint48 _blockNumberOffset,
+        address _initialOwner,
+        address _treasury,
+        uint24 _minTickSpacing
+    ) BaseHook(_poolManager) LiquidityPenaltyHook(_blockNumberOffset) Ownable(_initialOwner) {
         if (_treasury == address(0)) revert ZeroAddress();
         if (_initialOwner == address(0)) revert ZeroAddress();
+        if (_minTickSpacing == 0) revert TickSpacingTooSmall(0, 1);
         treasury = _treasury;
         feeDestination = FeeDestination.DonateToLPs;
+        minTickSpacing = _minTickSpacing;
     }
 
     function setTreasury(address newTreasury) external onlyOwner {
@@ -100,10 +108,12 @@ contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step,
         feeDestination = newDestination;
     }
 
-    // Called by BaseDynamicAfterFee._afterSwap once it's already minted feeAmount of the
-    // unspecified currency to us as an ERC-6909 claim. Our only job here is deciding where it
-    // goes. Direction check mirrors what BaseDynamicAfterFee does internally so we always match
-    // the currency the fee was actually minted in.
+    function setMinTickSpacing(uint24 newMinTickSpacing) external onlyOwner {
+        if (newMinTickSpacing == 0) revert TickSpacingTooSmall(0, 1);
+        emit MinTickSpacingUpdated(minTickSpacing, newMinTickSpacing);
+        minTickSpacing = newMinTickSpacing;
+    }
+
     function _afterSwapHandler(
         PoolKey calldata key,
         SwapParams calldata params,
@@ -116,34 +126,24 @@ contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step,
         PoolId poolId = key.toId();
         Currency unspecified = (params.amountSpecified < 0 == params.zeroForOne) ? key.currency1 : key.currency0;
 
-        // donate() reverts on zero in-range liquidity, so fall back to treasury rather than
-        // brick the swap. TODO: this silently changes behavior for that one swap even when
-        // feeDestination is set to DonateToLPs, might be worth an event so it's not invisible.
+        // TODO: silently falls back to treasury when donate() can't be used, worth its own event
         bool canDonate = feeDestination == FeeDestination.DonateToLPs && poolManager.getLiquidity(poolId) > 0;
 
         if (canDonate) {
             uint256 amount0 = unspecified == key.currency0 ? feeAmount : 0;
             uint256 amount1 = unspecified == key.currency1 ? feeAmount : 0;
 
-            // donate() opens a debt against us equal to what we just donated, we immediately
-            // close it by burning the claim we're already holding. No token movement, no
-            // external call, nothing for reentrancy to grab onto.
             poolManager.donate(key, amount0, amount1, "");
             unspecified.settle(poolManager, address(this), feeAmount, true);
 
             emit CapturedFeeDonated(poolId, unspecified, feeAmount);
         } else {
-            // Plain claim transfer, no mint/burn, can't revert on pool liquidity state.
             poolManager.transfer(treasury, unspecified.toId(), feeAmount);
 
             emit CapturedFeeSentToTreasury(poolId, unspecified, feeAmount);
         }
     }
 
-    /// @notice Treasury redeems its ERC-6909 claims for the underlying token.
-    /// @dev Opens its own unlock() context, separate from any swap. nonReentrant here because
-    /// this is a top-level call from the treasury, not a PoolManager callback, so we're not
-    /// already inside its lock.
     function redeemTreasuryClaims(Currency currency, uint256 amount, address to) external nonReentrant {
         if (msg.sender != treasury) revert Ownable.OwnableUnauthorizedAccount(msg.sender);
         if (to == address(0)) revert ZeroAddress();
@@ -162,6 +162,13 @@ contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step,
 
         emit TreasuryClaimsRedeemed(action.currency, action.amount, action.to);
         return "";
+    }
+
+    function _beforeInitialize(address, PoolKey calldata key, uint160) internal view override returns (bytes4) {
+        if (key.tickSpacing < int24(minTickSpacing)) {
+            revert TickSpacingTooSmall(key.tickSpacing, minTickSpacing);
+        }
+        return this.beforeInitialize.selector;
     }
 
     // --- diamond inheritance cleanup ---
@@ -208,8 +215,6 @@ contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step,
         return super._afterSwap(sender, key, params, delta, hookData);
     }
 
-    // Both parents do the exact same thing here (uint48(block.number)), keeping it overridable
-    // in case we ever need a custom clock on some L2 with weird block semantics.
     function _getBlockNumber() internal view override(AntiSandwichHook, LiquidityPenaltyHook) returns (uint48) {
         return uint48(block.number);
     }
@@ -221,7 +226,7 @@ contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step,
         returns (Hooks.Permissions memory)
     {
         return Hooks.Permissions({
-            beforeInitialize: false,
+            beforeInitialize: true,
             afterInitialize: false,
             beforeAddLiquidity: false,
             afterAddLiquidity: true,
