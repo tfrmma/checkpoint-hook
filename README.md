@@ -1,5 +1,7 @@
 # CheckpointHook
 
+[![CI](https://github.com/tfrmma/checkpoint-hook/actions/workflows/ci.yml/badge.svg)](https://github.com/tfrmma/checkpoint-hook/actions/workflows/ci.yml)
+
 A Uniswap v4 hook that combines sandwich-resistant swap execution with JIT-liquidity penalties in
 a single pool-level MEV mitigation. Built on top of OpenZeppelin's `uniswap-hooks` library rather
 than reimplementing either mechanism from scratch.
@@ -36,6 +38,9 @@ repository's contribution is:
   or routed to a governance-controlled treasury for later redemption.
 - Governance and treasury management (`Ownable2Step`), with a dedicated `unlock`/`unlockCallback`
   flow for redeeming treasury claims into the underlying ERC-20.
+- A `minTickSpacing` floor enforced at pool initialization, bounding the worst case of
+  `AntiSandwichHook`'s tick-crossing loop (see Known limitations) by refusing to attach to pools
+  below it in the first place.
 - A test suite that includes a direct economic comparison: the identical sandwich-attack sequence
   run against a hook-protected pool and against a vanilla pool, demonstrating the mitigation's
   effect rather than asserting it in isolation.
@@ -70,11 +75,12 @@ test/
 ### Install dependencies
 
 This repository ships source only. Dependencies are pulled via `forge install` rather than vendored
-in the repo (roughly 100 MB of nested submodules otherwise):
+in the repo (roughly 100 MB of nested submodules otherwise). Run these inside a git repository
+(`git init` first if you haven't already), `forge install` uses git submodules under the hood:
 
 ```bash
-forge install foundry-rs/forge-std@v1.11.0 --no-commit
-forge install OpenZeppelin/uniswap-hooks@v1.2.1 --no-commit
+forge install foundry-rs/forge-std@v1.11.0
+forge install OpenZeppelin/uniswap-hooks@v1.2.1
 ```
 
 The second command recursively pulls `uniswap-hooks`' own pinned copies of `v4-core`,
@@ -110,6 +116,7 @@ export POOL_MANAGER=0x...          # target chain's Uniswap v4 PoolManager
 export GOVERNANCE_ADDRESS=0x...    # recommended: a timelocked multisig, not an EOA
 export TREASURY_ADDRESS=0x...
 export BLOCK_NUMBER_OFFSET=5       # optional, JIT-protection window in blocks, defaults to 5
+export MIN_TICK_SPACING=60         # optional, floor on pools this hook can attach to, defaults to 60
 
 forge script script/DeployCheckpointHook.s.sol:DeployCheckpointHook \
   --rpc-url <RPC_URL> \
@@ -131,10 +138,13 @@ This is a mitigation, not a guarantee of zero MEV.
 - **Single-direction protection.** `AntiSandwichHook` protects only the `!zeroForOne` direction, a
   documented limitation of the upstream library. Symmetric protection would roughly double
   `beforeSwap` gas cost, a tradeoff this repository does not take.
-- **Unbounded tick-crossing loop.** `beforeSwap` iterates every initialized tick crossed since the
-  last checkpoint. Pools with very small `tickSpacing` and large intra-block price moves can hit an
-  out-of-gas condition. Avoid deploying on pools with tick spacing that is pathologically small
-  relative to expected volatility.
+- **Tick-crossing loop, partially bounded.** `beforeSwap` iterates every initialized tick crossed
+  since the last checkpoint, once per block. `minTickSpacing` (enforced at pool initialization,
+  defaults to 60 in the deploy script) bounds the worst case by refusing to attach to pools with
+  too small a spacing, but it reduces the risk rather than eliminating it: a large enough
+  intra-block price move can still make that loop expensive even at a sane spacing. Lowering
+  `minTickSpacing` via governance only affects pools initialized afterward, it can't retroactively
+  change an existing pool's `tickSpacing`.
 - **Wider intra-block price drift.** Reducing in-block arbitrage means this pool's price can drift
   further from the global reference price intra-block than a vanilla AMM would. Account for this
   when sourcing external price feeds from this pool.
