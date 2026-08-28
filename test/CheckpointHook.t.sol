@@ -29,19 +29,73 @@ contract CheckpointHookTest is CheckpointHookTestBase {
         assertEq(hook.treasury(), treasury);
         assertEq(uint8(hook.feeDestination()), uint8(CheckpointHook.FeeDestination.DonateToLPs));
         assertEq(hook.blockNumberOffset(), BLOCK_OFFSET);
+        assertEq(hook.minTickSpacing(), MIN_TICK_SPACING);
     }
 
     function test_constructor_revertsOnZeroTreasury() public {
         uint160 flags = uint160(
-            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
-                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
                 | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
         );
-        bytes memory constructorArgs = abi.encode(manager, BLOCK_OFFSET, governance, address(0));
+        bytes memory constructorArgs =
+            abi.encode(manager, BLOCK_OFFSET, governance, address(0), MIN_TICK_SPACING);
         (, bytes32 salt) = HookMiner.find(address(this), flags, type(CheckpointHook).creationCode, constructorArgs);
 
         vm.expectRevert(CheckpointHook.ZeroAddress.selector);
-        new CheckpointHook{salt: salt}(manager, BLOCK_OFFSET, governance, address(0));
+        new CheckpointHook{salt: salt}(manager, BLOCK_OFFSET, governance, address(0), MIN_TICK_SPACING);
+    }
+
+    function test_constructor_revertsOnZeroMinTickSpacing() public {
+        uint160 flags = uint160(
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory constructorArgs = abi.encode(manager, BLOCK_OFFSET, governance, treasury, uint24(0));
+        (, bytes32 salt) = HookMiner.find(address(this), flags, type(CheckpointHook).creationCode, constructorArgs);
+
+        vm.expectRevert(abi.encodeWithSelector(CheckpointHook.TickSpacingTooSmall.selector, int24(0), uint24(1)));
+        new CheckpointHook{salt: salt}(manager, BLOCK_OFFSET, governance, treasury, uint24(0));
+    }
+
+    // The whole point of minTickSpacing: a pool created below the floor should never even get
+    // this hook attached, closing off the tick-crossing OOG risk at the source instead of trying
+    // to bound the loop itself.
+    //
+    // Not matching the exact revert reason here: PoolManager wraps hook reverts in its own
+    // ERC-7751 WrappedError(target, selector, reason, details), and reconstructing that encoding
+    // byte for byte is brittle across v4-core versions. Bare expectRevert plus the positive case
+    // right below (which proves the hook doesn't just reject everything) is good enough coverage.
+    function test_initialize_revertsBelowMinTickSpacing() public {
+        assertLt(uint24(1), hook.minTickSpacing(), "test assumes MIN_TICK_SPACING > 1");
+
+        vm.expectRevert();
+        initPool(currency0, currency1, IHooks(address(hook)), 500, 1, SQRT_PRICE_1_1);
+    }
+
+    function test_initialize_succeedsAtOrAboveMinTickSpacing() public {
+        // poolKey from setUp() already used tickSpacing 60 >= MIN_TICK_SPACING, this just makes
+        // the boundary condition explicit with a second pool at exactly the floor
+        (PoolKey memory keyAtFloor,) =
+            initPool(currency0, currency1, IHooks(address(hook)), 500, int24(uint24(MIN_TICK_SPACING)), SQRT_PRICE_1_1);
+        assertEq(keyAtFloor.tickSpacing, int24(uint24(MIN_TICK_SPACING)));
+    }
+
+    function test_governance_onlyOwnerCanSetMinTickSpacing() public {
+        vm.prank(alice);
+        vm.expectRevert();
+        hook.setMinTickSpacing(20);
+
+        vm.prank(governance);
+        hook.setMinTickSpacing(20);
+        assertEq(hook.minTickSpacing(), 20);
+    }
+
+    function test_governance_setMinTickSpacingRevertsOnZero() public {
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(CheckpointHook.TickSpacingTooSmall.selector, int24(0), uint24(1)));
+        hook.setMinTickSpacing(0);
     }
 
     function test_governance_onlyOwnerCanSetTreasury() public {
