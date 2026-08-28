@@ -67,10 +67,23 @@ test/
 
 - [Foundry](https://book.getfoundry.sh/getting-started/installation)
 
+### Install dependencies
+
+This repository ships source only. Dependencies are pulled via `forge install` rather than vendored
+in the repo (roughly 100 MB of nested submodules otherwise):
+
+```bash
+forge install foundry-rs/forge-std@v1.11.0 --no-commit
+forge install OpenZeppelin/uniswap-hooks@v1.2.1 --no-commit
+```
+
+The second command recursively pulls `uniswap-hooks`' own pinned copies of `v4-core`,
+`v4-periphery`, and `openzeppelin-contracts`, matching `foundry.toml`'s remappings. Use the exact
+versions above, the hook is built and tested against them specifically.
+
 ### Build
 
 ```bash
-forge install
 forge build
 ```
 
