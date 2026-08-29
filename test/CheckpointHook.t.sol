@@ -13,6 +13,8 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
+import {IPoolManagerEvents} from "uniswap-hooks/test/utils/interfaces/IPoolManagerEvents.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 import {CheckpointHook} from "../src/CheckpointHook.sol";
 
@@ -395,19 +397,94 @@ contract CheckpointHookTest is CheckpointHookTestBase {
         );
     }
 
-    function test_jitLiquidity_feesAreWithheldWithinOffsetWindow() public {
-        _fundAndApprove(alice);
-        _fundAndApprove(attacker);
+    // PoolManager's own Donate event with nonzero amounts is the unambiguous signal the penalty
+    // actually landed, not just that liquidity removal succeeded. Two equal-sized LPs in the same
+    // range: one long-term (added well before the JIT window), one JIT (added and removed in the
+    // same block). The JIT removal gets a 100% penalty per LiquidityPenaltyHook's formula
+    // (removed at block 0 of its own window), donated to whoever's left in range, the long-term LP.
+    function test_jitLiquidity_penaltyIsDonatedOnRemoval() public {
+        deployFreshManagerAndRouters();
+        deployMintAndApprove2Currencies();
+
+        uint160 flags = uint160(
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory constructorArgs = abi.encode(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
+        (address hookAddress, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(CheckpointHook).creationCode, constructorArgs);
+        CheckpointHook h =
+            new CheckpointHook{salt: salt}(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
+        require(address(h) == hookAddress);
+
+        (PoolKey memory key, PoolId poolId) =
+            initPool(currency0, currency1, IHooks(address(h)), 3000, 60, SQRT_PRICE_1_1);
+
+        // long-term LP, salt 0, added well before the JIT window
+        vm.roll(100);
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 1e18, salt: bytes32(uint256(0))}),
+            ""
+        );
+
+        vm.roll(100 + BLOCK_OFFSET + 10);
+
+        // JIT LP, salt 1, same range and size, added this block
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 1e18, salt: bytes32(uint256(1))}),
+            ""
+        );
+
+        _fundAndApprove(attacker, 1_000_000 ether, 1_000_000 ether);
+        PoolSwapTest.TestSettings memory settings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
         vm.prank(attacker);
-        _swap(attacker, true, -1e17);
+        swapRouter.swap(
+            key, SwapParams({zeroForOne: true, amountSpecified: -1e17, sqrtPriceLimitX96: MIN_PRICE_LIMIT}), settings, ""
+        );
 
-        // not asserting exact penalty magnitude here, that's already covered by OZ's own tests
-        // for LiquidityPenaltyHook. this just checks the wiring doesn't blow up.
-        // TODO: worth adding a dedicated test that adds/removes liquidity inside the offset
-        // window and checks the withheld fee actually shows up as a donation, right now we're
-        // trusting the library's own coverage for that.
-        assertEq(hook.blockNumberOffset(), BLOCK_OFFSET);
+        vm.expectEmit(true, false, false, false, address(manager));
+        emit IPoolManagerEvents.Donate(poolId, address(h), 0, 0);
+
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: -1e18, salt: bytes32(uint256(1))}),
+            ""
+        );
+    }
+
+    // Negative control for the test above: a normal LP that waits out the offset before removing
+    // should never trigger a donation. Uses vm.recordLogs since expectNoEmit isn't available in
+    // this forge-std version, checking the removal's own logs directly for the absence of Donate.
+    function test_liquidityRemoval_outsideWindowDoesNotDonate() public {
+        _fundAndApprove(alice);
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 1e18, salt: bytes32(uint256(2))}),
+            ""
+        );
+
+        vm.roll(block.number + BLOCK_OFFSET + 10);
+
+        vm.recordLogs();
+        modifyLiquidityRouter.modifyLiquidity(
+            poolKey,
+            ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: -1e18, salt: bytes32(uint256(2))}),
+            ""
+        );
+
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 donateTopic = IPoolManagerEvents.Donate.selector;
+        for (uint256 i = 0; i < entries.length; i++) {
+            assertFalse(
+                entries[i].topics.length > 0 && entries[i].topics[0] == donateTopic,
+                "removal outside the JIT window should not donate"
+            );
+        }
     }
 
     function _fundAndApprove(address user) internal {
