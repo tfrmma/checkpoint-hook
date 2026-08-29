@@ -7,6 +7,7 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
@@ -291,6 +292,107 @@ contract CheckpointHookTest is CheckpointHookTestBase {
         _swap(alice, true, -1e17);
 
         assertLt(currency0.balanceOf(alice), before0, "swap should have debited currency0");
+    }
+
+    // Deliberately drives the pool's active-tick liquidity to zero mid-fee-capture, to confirm
+    // the fallback path fires CapturedFeeDonateFallback rather than the ambiguous
+    // CapturedFeeSentToTreasury a deliberate Treasury policy would emit. Numbers below were found
+    // empirically (see scratch notes): AntiSandwichHook only caps the zeroForOne=false direction,
+    // and _getTargetUnspecified simulates with lpFeeOverride=0, so the checkpoint deviation from
+    // swap A has to be large enough to outweigh the real swap's actual pool fee before swap B
+    // shows a capturable difference at all.
+    function test_capturedFee_fallsBackToTreasuryWhenLiquidityExhausted() public {
+        deployFreshManagerAndRouters();
+        deployMintAndApprove2Currencies();
+
+        uint160 flags = uint160(
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory constructorArgs = abi.encode(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
+        (address hookAddress, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(CheckpointHook).creationCode, constructorArgs);
+        CheckpointHook h =
+            new CheckpointHook{salt: salt}(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
+        require(address(h) == hookAddress);
+
+        (PoolKey memory key, PoolId poolId) =
+            initPool(currency0, currency1, IHooks(address(h)), 3000, 60, SQRT_PRICE_1_1);
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 1e18, salt: 0}), ""
+        );
+
+        _fundAndApprove(attacker, 1_000_000 ether, 1_000_000 ether);
+        PoolSwapTest.TestSettings memory settings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        // Swap A: zeroForOne=true is the uncapped direction, moves price down and sets up a large
+        // checkpoint deviation for swap B to be measured against.
+        vm.prank(attacker);
+        swapRouter.swap(
+            key, SwapParams({zeroForOne: true, amountSpecified: -3e16, sqrtPriceLimitX96: MIN_PRICE_LIMIT}), settings, ""
+        );
+
+        // Swap B: zeroForOne=false is the capped direction. Sized to both capture a fee (real
+        // execution beats the checkpoint-simulated target) and fully exhaust the range on the way
+        // through it, so getLiquidity(poolId) is 0 by the time _afterSwapHandler runs.
+        vm.expectEmit(true, true, false, false, address(h));
+        emit CheckpointHook.CapturedFeeDonateFallback(poolId, currency0, 0);
+
+        vm.prank(attacker);
+        swapRouter.swap(
+            key, SwapParams({zeroForOne: false, amountSpecified: -6e16, sqrtPriceLimitX96: MAX_PRICE_LIMIT}), settings, ""
+        );
+
+        assertEq(manager.getLiquidity(poolId), 0, "test setup assumption: range should be exhausted");
+    }
+
+    // Same fee-capturing swap pair as above, but with governance already set to Treasury policy.
+    // Confirms the deliberate-policy event fires instead of the fallback one, even though this
+    // particular swap combo also happens to exhaust the range, the distinction is about *why* it
+    // went to treasury, not incidental liquidity state.
+    function test_capturedFee_explicitTreasuryPolicyEmitsDedicatedEvent() public {
+        deployFreshManagerAndRouters();
+        deployMintAndApprove2Currencies();
+
+        uint160 flags = uint160(
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory constructorArgs = abi.encode(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
+        (address hookAddress, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(CheckpointHook).creationCode, constructorArgs);
+        CheckpointHook h =
+            new CheckpointHook{salt: salt}(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
+        require(address(h) == hookAddress);
+
+        vm.prank(governance);
+        h.setFeeDestination(CheckpointHook.FeeDestination.Treasury);
+
+        (PoolKey memory key, PoolId poolId) =
+            initPool(currency0, currency1, IHooks(address(h)), 3000, 60, SQRT_PRICE_1_1);
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 1e18, salt: 0}), ""
+        );
+
+        _fundAndApprove(attacker, 1_000_000 ether, 1_000_000 ether);
+        PoolSwapTest.TestSettings memory settings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        vm.prank(attacker);
+        swapRouter.swap(
+            key, SwapParams({zeroForOne: true, amountSpecified: -3e16, sqrtPriceLimitX96: MIN_PRICE_LIMIT}), settings, ""
+        );
+
+        vm.expectEmit(true, true, false, false, address(h));
+        emit CheckpointHook.CapturedFeeSentToTreasury(poolId, currency0, 0);
+
+        vm.prank(attacker);
+        swapRouter.swap(
+            key, SwapParams({zeroForOne: false, amountSpecified: -6e16, sqrtPriceLimitX96: MAX_PRICE_LIMIT}), settings, ""
+        );
     }
 
     function test_jitLiquidity_feesAreWithheldWithinOffsetWindow() public {
