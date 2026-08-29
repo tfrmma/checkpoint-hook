@@ -74,6 +74,7 @@ contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step,
     event MinTickSpacingUpdated(uint24 oldMinTickSpacing, uint24 newMinTickSpacing);
     event CapturedFeeDonated(PoolId indexed poolId, Currency indexed currency, uint256 amount);
     event CapturedFeeSentToTreasury(PoolId indexed poolId, Currency indexed currency, uint256 amount);
+    event CapturedFeeDonateFallback(PoolId indexed poolId, Currency indexed currency, uint256 amount);
     event TreasuryClaimsRedeemed(Currency indexed currency, uint256 amount, address indexed to);
 
     address public treasury;
@@ -126,10 +127,10 @@ contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step,
         PoolId poolId = key.toId();
         Currency unspecified = (params.amountSpecified < 0 == params.zeroForOne) ? key.currency1 : key.currency0;
 
-        // TODO: silently falls back to treasury when donate() can't be used, worth its own event
-        bool canDonate = feeDestination == FeeDestination.DonateToLPs && poolManager.getLiquidity(poolId) > 0;
+        bool wantsDonate = feeDestination == FeeDestination.DonateToLPs;
+        bool hasLiquidity = poolManager.getLiquidity(poolId) > 0;
 
-        if (canDonate) {
+        if (wantsDonate && hasLiquidity) {
             uint256 amount0 = unspecified == key.currency0 ? feeAmount : 0;
             uint256 amount1 = unspecified == key.currency1 ? feeAmount : 0;
 
@@ -140,7 +141,11 @@ contract CheckpointHook is AntiSandwichHook, LiquidityPenaltyHook, Ownable2Step,
         } else {
             poolManager.transfer(treasury, unspecified.toId(), feeAmount);
 
-            emit CapturedFeeSentToTreasury(poolId, unspecified, feeAmount);
+            if (wantsDonate) {
+                emit CapturedFeeDonateFallback(poolId, unspecified, feeAmount);
+            } else {
+                emit CapturedFeeSentToTreasury(poolId, unspecified, feeAmount);
+            }
         }
     }
 
