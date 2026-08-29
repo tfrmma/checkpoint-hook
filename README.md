@@ -60,8 +60,10 @@ src/
   CheckpointHook.sol                   Hook contract
 script/
   DeployCheckpointHook.s.sol           CREATE2 / HookMiner deployment script
+  DeployTimelock.s.sol                 TimelockController deployment + ownership handover
 test/
   CheckpointHook.t.sol                 Unit and economic-simulation tests
+  CheckpointHookTimelock.t.sol         Timelocked governance handover tests
   utils/
     CheckpointHookTestBase.sol         Shared test fixtures
 ```
@@ -99,15 +101,17 @@ forge build
 forge test -vv
 ```
 
-The suite covers nine cases, of which two form the core proof of the hook's effect:
+The suite covers 25 cases across two files, of which three form the core proof of the hook's effect:
 
 | Test | Purpose |
 |---|---|
-| `test_sandwichAttack_isUnprofitableWithinSameBlock` | Runs a full frontrun, victim, backrun sequence against the protected pool and asserts the attacker ends the block at a net loss. |
-| `test_baseline_sandwichAttack_isProfitableWithoutTheHook` | Runs the identical sequence against an unprotected pool and asserts the attacker is profitable there, establishing the baseline the first test is measured against. |
+| `test_sandwichAttack_isUnprofitableWithinSameBlock` | Runs a full frontrun, victim, backrun sequence against the protected pool with fixed trade sizes and asserts the attacker ends the block at a net loss. |
+| `testFuzz_sandwichAttack_neverProfitable` | Same sequence, fuzzed across liquidity depth (1e17-1e26) and both trade sizes (1e10-3e18) over 1000 runs, each against a freshly deployed pool. Confirms the property holds generally rather than for one hand-picked set of numbers. |
+| `test_baseline_sandwichAttack_isProfitableWithoutTheHook` | Runs the identical fixed-size sequence against an unprotected pool and asserts the attacker is profitable there, establishing the baseline the other two are measured against. |
 
-The remaining tests cover governance access control, permission-flag encoding, JIT-protection
-wiring, and normal swap execution.
+The remaining tests cover governance access control, permission-flag encoding, the tick-spacing
+guard, JIT-penalty donation, and normal swap execution. The timelocked governance handover has its
+own file, `CheckpointHookTimelock.t.sol`.
 
 ## Deployment
 
@@ -127,6 +131,35 @@ forge script script/DeployCheckpointHook.s.sol:DeployCheckpointHook \
 The script mines a CREATE2 salt via `HookMiner` so the deployed address encodes the hook's required
 permission flags, and deploys through the canonical deterministic deployer
 (`0x4e59b44847b379578588920cA78FbF26c0B4956C`), which must already be present on the target chain.
+
+### Moving governance to a timelock
+
+`GOVERNANCE_ADDRESS` above can be an EOA to start (simpler for testnets or an initial bootstrap),
+but before real value is at risk, hand it off to an OpenZeppelin `TimelockController` so
+`setTreasury`, `setFeeDestination`, and `setMinTickSpacing` all go through a mandatory delay.
+`CheckpointHook` itself needed no changes for this, `Ownable2Step` already accepts any address as
+owner, `TimelockController` is designed to be dropped in as one.
+
+```bash
+export HOOK_ADDRESS=0x...
+export MIN_DELAY=172800            # 2 days, in seconds
+export PROPOSERS=0x...,0x...       # must include the broadcaster to also schedule step 2 below
+export EXECUTORS=0x0000000000000000000000000000000000000000   # open role, or a comma list
+
+forge script script/DeployTimelock.s.sol:DeployTimelock \
+  --rpc-url <RPC_URL> \
+  --private-key <CURRENT_GOVERNANCE_KEY> \
+  --broadcast
+```
+
+This is a two-step handover by design (`Ownable2Step` requires the new owner to accept, and a
+timelock can only act through its own schedule/execute flow, there's no way to make it atomic).
+The script deploys the timelock, calls `transferOwnership`, and if the broadcaster holds
+`PROPOSER_ROLE`, schedules the `acceptOwnership()` call too. Once `MIN_DELAY` has elapsed, finish
+it by calling `execute()` on the timelock with the same target/payload/predecessor/salt the script
+logged, from any address holding `EXECUTOR_ROLE` (or anyone, if `EXECUTORS` was left open). After
+that, `hook.owner()` is the timelock, and every governance change needs its own
+schedule-wait-execute cycle.
 
 ## Known limitations
 
@@ -157,7 +190,7 @@ This code has not undergone an independent, professional third-party audit. It b
 OpenZeppelin's `uniswap-hooks` library, which underwent a scoped audit round covering the two base
 mechanisms; the composition, fee-routing, and treasury logic in this repository are not covered by
 that audit. Do not deploy with third-party funds at risk without an independent review.
-
+.
 ## License
 
 MIT
