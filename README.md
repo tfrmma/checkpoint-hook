@@ -63,6 +63,7 @@ script/
   DeployTimelock.s.sol                 TimelockController deployment + ownership handover
 test/
   CheckpointHook.t.sol                 Unit and economic-simulation tests
+  CheckpointHookFork.t.sol             Fork test against Base mainnet's real PoolManager
   CheckpointHookTimelock.t.sol         Timelocked governance handover tests
   utils/
     CheckpointHookTestBase.sol         Shared test fixtures
@@ -101,7 +102,7 @@ forge build
 forge test -vv
 ```
 
-The suite covers 25 cases across two files, of which three form the core proof of the hook's effect:
+The suite covers 27 cases across three files, of which three form the core proof of the hook's effect:
 
 | Test | Purpose |
 |---|---|
@@ -109,9 +110,33 @@ The suite covers 25 cases across two files, of which three form the core proof o
 | `testFuzz_sandwichAttack_neverProfitable` | Same sequence, fuzzed across liquidity depth (1e17-1e26) and both trade sizes (1e10-3e18) over 1000 runs, each against a freshly deployed pool. Confirms the property holds generally rather than for one hand-picked set of numbers. |
 | `test_baseline_sandwichAttack_isProfitableWithoutTheHook` | Runs the identical fixed-size sequence against an unprotected pool and asserts the attacker is profitable there, establishing the baseline the other two are measured against. |
 
+`testFuzz_sandwichAttack_neverProfitable_acrossPoolConfigs` extends the same property across pool
+configuration itself, fuzzing `tickSpacing` (10-2000), `fee` (0.0001%-10%), and the initial tick
+(±200,000), 256 runs. Both fuzz tests were checked for false positives during development, an
+instrumented run confirmed 100% of iterations complete the full attack sequence rather than
+early-returning on a revert, and a deliberately inverted assertion was confirmed to fail before
+shipping the real one.
+
 The remaining tests cover governance access control, permission-flag encoding, the tick-spacing
 guard, JIT-penalty donation, and normal swap execution. The timelocked governance handover has its
 own file, `CheckpointHookTimelock.t.sol`.
+
+### Fork testing
+
+`CheckpointHookFork.t.sol` runs the same sandwich-attack proof against Base mainnet's real,
+already-deployed `PoolManager` (`0x498581fF718922c3f8e6A244956aF099B2652b2b`) instead of a fresh
+in-memory one, using real WETH/USDC. This is the one thing the rest of the suite can't tell you:
+that the hook survives contact with the actual deployed bytecode. It self-skips without an RPC
+configured rather than failing the whole suite:
+
+```bash
+export BASE_RPC_URL=<your RPC>
+forge test --match-contract CheckpointHookForkTest --fork-url $BASE_RPC_URL -vv
+```
+
+Optionally set `FORK_BLOCK` to pin a specific block for reproducibility, otherwise it forks at
+latest. Base was picked over other chains for this because it currently sees the most sandwich/MEV
+activity after Ethereum mainnet itself.
 
 ## Deployment
 
@@ -190,7 +215,7 @@ This code has not undergone an independent, professional third-party audit. It b
 OpenZeppelin's `uniswap-hooks` library, which underwent a scoped audit round covering the two base
 mechanisms; the composition, fee-routing, and treasury logic in this repository are not covered by
 that audit. Do not deploy with third-party funds at risk without an independent review.
-.
+
 ## License
 
 MIT
