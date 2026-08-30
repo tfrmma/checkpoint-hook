@@ -230,6 +230,136 @@ contract CheckpointHookTest is CheckpointHookTestBase {
         assertLe(currency0.balanceOf(attacker), before0, "attacker must not extract currency0 profit");
     }
 
+    // Second fuzz family: same property, but now also varies pool configuration itself
+    // (tickSpacing, fee, initial price) instead of holding it fixed at 3000/60/1:1. Bundled into a
+    // struct and split across helpers, six fuzzed params plus locals blew the stack otherwise.
+    // Verified this actually exercises the full attack path across configs (not early-returning on
+    // reverts) the same way as the test above, see the point-7 writeup for the instrumented run.
+    struct FuzzPoolConfig {
+        uint256 liquidityDelta;
+        uint256 frontrunAmount;
+        uint256 victimAmount;
+        int24 tickSpacing;
+        uint24 fee;
+        int24 initialTick;
+    }
+
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_sandwichAttack_neverProfitable_acrossPoolConfigs(
+        uint256 liquidityDelta,
+        uint256 frontrunAmount,
+        uint256 victimAmount,
+        int24 tickSpacing,
+        uint24 fee,
+        int24 initialTick
+    ) public {
+        FuzzPoolConfig memory cfg = FuzzPoolConfig({
+            liquidityDelta: bound(liquidityDelta, 1e17, 1e26),
+            frontrunAmount: bound(frontrunAmount, 1e10, 3e18),
+            victimAmount: bound(victimAmount, 1e10, 3e18),
+            // floor matches MIN_TICK_SPACING so _beforeInitialize's guard never rejects these;
+            // capped well under type(int16).max so minUsableTick/maxUsableTick stays meaningful
+            // instead of degenerating to a near-empty range at the extreme end
+            tickSpacing: int24(bound(int256(tickSpacing), int256(uint256(MIN_TICK_SPACING)), 2000)),
+            // capped at 10% (100_000 / 1_000_000), MAX_LP_FEE technically allows up to 100% but
+            // fees that extreme aren't a real pool configuration, just noise that would drown out
+            // the sandwich-profitability signal
+            fee: uint24(bound(uint256(fee), 1, 100_000)),
+            initialTick: int24(bound(int256(initialTick), -200_000, 200_000))
+        });
+
+        _runFuzzAttackAcrossConfig(cfg);
+    }
+
+    function _runFuzzAttackAcrossConfig(FuzzPoolConfig memory cfg) internal {
+        deployFreshManagerAndRouters();
+        deployMintAndApprove2Currencies();
+
+        CheckpointHook fuzzHook = _deployFuzzHookForConfig();
+        PoolKey memory fuzzKey = _initFuzzPoolForConfig(fuzzHook, cfg);
+
+        _fundAndApprove(attacker, 10_000 ether, 0);
+        _fundAndApprove(alice, 10_000 ether, 10_000 ether);
+
+        _runConfigAttackSequence(fuzzKey, cfg);
+    }
+
+    function _deployFuzzHookForConfig() internal returns (CheckpointHook fuzzHook) {
+        uint160 flags = uint160(
+            Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+        bytes memory constructorArgs = abi.encode(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
+        (address hookAddress, bytes32 salt) =
+            HookMiner.find(address(this), flags, type(CheckpointHook).creationCode, constructorArgs);
+        fuzzHook = new CheckpointHook{salt: salt}(manager, BLOCK_OFFSET, governance, treasury, MIN_TICK_SPACING);
+        require(address(fuzzHook) == hookAddress);
+    }
+
+    function _initFuzzPoolForConfig(CheckpointHook fuzzHook, FuzzPoolConfig memory cfg)
+        internal
+        returns (PoolKey memory fuzzKey)
+    {
+        uint160 startSqrtPriceX96 = TickMath.getSqrtPriceAtTick(cfg.initialTick);
+        (fuzzKey,) =
+            initPool(currency0, currency1, IHooks(address(fuzzHook)), cfg.fee, cfg.tickSpacing, startSqrtPriceX96);
+        modifyLiquidityRouter.modifyLiquidity(
+            fuzzKey,
+            ModifyLiquidityParams({
+                tickLower: TickMath.minUsableTick(cfg.tickSpacing),
+                tickUpper: TickMath.maxUsableTick(cfg.tickSpacing),
+                liquidityDelta: int256(cfg.liquidityDelta),
+                salt: 0
+            }),
+            ""
+        );
+    }
+
+    function _runConfigAttackSequence(PoolKey memory fuzzKey, FuzzPoolConfig memory cfg) internal {
+        PoolSwapTest.TestSettings memory settings = PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+        uint256 before0 = currency0.balanceOf(attacker);
+
+        vm.prank(attacker);
+        try swapRouter.swap(
+            fuzzKey,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -int256(cfg.frontrunAmount),
+                sqrtPriceLimitX96: MIN_PRICE_LIMIT
+            }),
+            settings,
+            ""
+        ) {} catch {
+            return;
+        }
+
+        vm.prank(alice);
+        try swapRouter.swap(
+            fuzzKey,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(cfg.victimAmount), sqrtPriceLimitX96: MIN_PRICE_LIMIT}),
+            settings,
+            ""
+        ) {} catch {
+            return;
+        }
+
+        uint256 held1 = currency1.balanceOf(attacker);
+        if (held1 == 0) return;
+
+        vm.prank(attacker);
+        try swapRouter.swap(
+            fuzzKey,
+            SwapParams({zeroForOne: false, amountSpecified: -int256(held1), sqrtPriceLimitX96: MAX_PRICE_LIMIT}),
+            settings,
+            ""
+        ) {} catch {
+            return;
+        }
+
+        assertLe(currency0.balanceOf(attacker), before0, "attacker must not extract currency0 profit");
+    }
+
     // Same exact bundle, no hook this time. This is the baseline, confirms the pool is actually
     // sandwichable without protection so the test above means something and isn't just passing
     // because the trade sizes happen to be too small to matter.
