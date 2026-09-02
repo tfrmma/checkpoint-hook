@@ -92,6 +92,14 @@ contract CheckpointHookForkTest is Test {
         // tiers. Starting price is a nominal 1:1 in raw units (tick 0), not real WETH/USDC market
         // price, that mismatch doesn't matter here: the checkpoint mechanism only cares about
         // relative price movement within a block, not what the absolute starting price represents.
+        // Nominal 1:1 (tick 0) was wrong: v4's liquidity math is decimals-agnostic, all raw
+        // integer units, and for an 18-decimal/6-decimal pair that "1:1" is actually an absurd
+        // real-world price. Backing even a modest liquidityDelta at that price needed far more
+        // USDC than any sane amount to deal. This tick approximates ~2500 USDC per WETH
+        // (2500 * 1e6 / 1e18 raw price, converted via log base 1.0001, rounded to a tickSpacing-60
+        // multiple), it's a rough approximation for testing purposes, not tracking live market
+        // price, real WETH/USDC rate doesn't matter for what this test is proving.
+        int24 initialTick = -198060;
         poolKey = PoolKey({
             currency0: Currency.wrap(BASE_WETH),
             currency1: Currency.wrap(BASE_USDC),
@@ -99,19 +107,25 @@ contract CheckpointHookForkTest is Test {
             tickSpacing: 60,
             hooks: IHooks(address(hook))
         });
-        manager.initialize(poolKey, TickMath.getSqrtPriceAtTick(0));
+        manager.initialize(poolKey, TickMath.getSqrtPriceAtTick(initialTick));
 
-        // Narrow range around the nominal tick 0 starting price, not full range. Full range at
-        // tick 0 with real 18/6-decimal-mismatched WETH/USDC implies an absurd price for one of
-        // the two tokens, covering that entire range would need token amounts far beyond anything
-        // reasonable to fund in a test. This magnitude (1e18 over +-6000 ticks) already handles
-        // the exact swap sizes used below, it's the same combination proven in the JIT tests.
+        // +-6000 ticks around the realistic price above, liquidityDelta chosen to need roughly
+        // 52 WETH and 130,000 USDC (verified with the exact v3/v4 liquidity math offline before
+        // picking this number), comfortably inside what's dealt below and deep enough that the
+        // 0.6 WETH combined frontrun+victim size below is a small fraction of it.
         IERC20Minimal(BASE_WETH).approve(address(modifyLiquidityRouter), type(uint256).max);
         IERC20Minimal(BASE_USDC).approve(address(modifyLiquidityRouter), type(uint256).max);
         deal(BASE_WETH, address(this), 1_000_000 ether);
         deal(BASE_USDC, address(this), 1_000_000_000e6);
         modifyLiquidityRouter.modifyLiquidity(
-            poolKey, ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 1e18, salt: 0}), ""
+            poolKey,
+            ModifyLiquidityParams({
+                tickLower: initialTick - 6000,
+                tickUpper: initialTick + 6000,
+                liquidityDelta: 1e16,
+                salt: 0
+            }),
+            ""
         );
 
         deal(BASE_WETH, attacker, 1_000 ether);
