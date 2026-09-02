@@ -101,19 +101,17 @@ contract CheckpointHookForkTest is Test {
         });
         manager.initialize(poolKey, TickMath.getSqrtPriceAtTick(0));
 
+        // Narrow range around the nominal tick 0 starting price, not full range. Full range at
+        // tick 0 with real 18/6-decimal-mismatched WETH/USDC implies an absurd price for one of
+        // the two tokens, covering that entire range would need token amounts far beyond anything
+        // reasonable to fund in a test. This magnitude (1e18 over +-6000 ticks) already handles
+        // the exact swap sizes used below, it's the same combination proven in the JIT tests.
         IERC20Minimal(BASE_WETH).approve(address(modifyLiquidityRouter), type(uint256).max);
         IERC20Minimal(BASE_USDC).approve(address(modifyLiquidityRouter), type(uint256).max);
         deal(BASE_WETH, address(this), 1_000_000 ether);
         deal(BASE_USDC, address(this), 1_000_000_000e6);
         modifyLiquidityRouter.modifyLiquidity(
-            poolKey,
-            ModifyLiquidityParams({
-                tickLower: TickMath.minUsableTick(60),
-                tickUpper: TickMath.maxUsableTick(60),
-                liquidityDelta: 1e24,
-                salt: 0
-            }),
-            ""
+            poolKey, ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 1e18, salt: 0}), ""
         );
 
         deal(BASE_WETH, attacker, 1_000 ether);
