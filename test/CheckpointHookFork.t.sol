@@ -139,8 +139,10 @@ contract CheckpointHookForkTest is Test {
         deal(BASE_WETH, alice, 1_000 ether);
         deal(BASE_USDC, alice, 1_000_000e6);
 
-        vm.prank(attacker);
+        vm.startPrank(attacker);
         IERC20Minimal(BASE_WETH).approve(address(swapRouter), type(uint256).max);
+        IERC20Minimal(BASE_USDC).approve(address(swapRouter), type(uint256).max);
+        vm.stopPrank();
         vm.startPrank(alice);
         IERC20Minimal(BASE_WETH).approve(address(swapRouter), type(uint256).max);
         IERC20Minimal(BASE_USDC).approve(address(swapRouter), type(uint256).max);
