@@ -128,6 +128,13 @@ contract CheckpointHookForkTest is Test {
             ""
         );
 
+        // Native ETH for gas, separate from the WETH/USDC token balances below. attacker/alice
+        // are makeAddr()-derived, they start at zero ETH, and on a real fork (unlike a fresh
+        // in-memory PoolManager where address(this) has Foundry's default huge balance) any call
+        // they make needs to actually cover its own gas/fee.
+        vm.deal(attacker, 1 ether);
+        vm.deal(alice, 1 ether);
+
         deal(BASE_WETH, attacker, 1_000 ether);
         deal(BASE_WETH, alice, 1_000 ether);
         deal(BASE_USDC, alice, 1_000_000e6);
